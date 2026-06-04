@@ -54,6 +54,84 @@ _STREAM_END = "__STREAM_END__"
 _CANCEL = "__CANCEL__"
 
 
+async def _dispatch_non_stream_request(
+    handler: Any,
+    response_queue: Any,
+    req_id: str,
+    method_name: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> None:
+    """Run a single non-streaming handler method and enqueue the result.
+
+    Extracted from ``_handler_worker`` so it can be unit-tested directly and
+    so the (upstream issue #307) ``TimeoutError`` handling is in one place.
+
+    Behavior:
+      - On success: enqueues ``{"type": "result", "value": ...}``.
+      - On ``TimeoutError`` / ``asyncio.TimeoutError``: enqueues an error
+        with ``status_code=504`` (upstream #307). Logs at WARNING — the
+        timeout is recoverable and the subprocess must keep serving.
+      - On any other ``Exception``: enqueues an error with the original
+        ``status_code`` if the exception carries one, else 500.
+    """
+    try:
+        method = getattr(handler, method_name)
+        result = await method(*args, **kwargs)
+        response_queue.put({"id": req_id, "type": "result", "value": result})
+    except (TimeoutError, asyncio.TimeoutError) as exc:
+        # Upstream #307: a request that times out is NOT a subprocess crash.
+        # Report 504 so callers (cli-v2 lifecycle, gateways) treat it as a
+        # retriable upstream timeout, not an opaque 500 panic.
+        logger.warning(
+            f"Request {req_id} (method={method_name}) timed out: {exc}"
+        )
+        response_queue.put(
+            {
+                "id": req_id,
+                "type": "error",
+                "error_type": type(exc).__name__,
+                "message": str(exc) or "request timeout",
+                "status_code": 504,
+                "detail": None,
+            }
+        )
+    except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error(f"Error handling request {req_id} (method={method_name}): {exc}\n{tb}")
+        response_queue.put(
+            {
+                "id": req_id,
+                "type": "error",
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+                "status_code": getattr(exc, "status_code", 500),
+                "detail": getattr(exc, "detail", None),
+            }
+        )
+
+
+async def _handle_request_for_test(
+    handler: Any,
+    response_queue: Any,
+    request: dict[str, Any],
+) -> None:
+    """Test seam: drive ``_dispatch_non_stream_request`` from a unit test.
+
+    Mirrors the public shape of the closure inside ``_handler_worker`` so
+    tests don't need to spawn a subprocess to exercise the dispatch surface.
+    Only the non-stream branch is wired here — streaming dispatch already
+    has dedicated coverage in ``test_handler_process_stream_cancellation.py``.
+    """
+    req_id = request.get("id", "")
+    method_name = request.get("method", "")
+    args = request.get("args", ())
+    kwargs = request.get("kwargs", {})
+    await _dispatch_non_stream_request(
+        handler, response_queue, req_id, method_name, args, kwargs
+    )
+
+
 async def _stream_until_cancelled(
     stream: AsyncGenerator[Any, None],
     should_cancel: Callable[[], bool],
@@ -333,10 +411,13 @@ def _handler_worker(
             kwargs: dict[str, Any] = request.get("kwargs", {})
             is_stream: bool = request.get("stream", False)
 
-            try:
-                method = getattr(handler, method_name)
-
-                if is_stream:
+            if is_stream:
+                # Streaming dispatch still lives here because it captures
+                # ``_cancelled_lock`` and ``_cancelled_ids`` from the enclosing
+                # scope. Errors are caught and reported with the same shape
+                # as ``_dispatch_non_stream_request``.
+                try:
+                    method = getattr(handler, method_name)
                     stream = method(*args, **kwargs)
 
                     def _request_cancelled(_req_id: str = req_id) -> bool:
@@ -351,21 +432,44 @@ def _handler_worker(
                     response_queue.put({"id": req_id, "type": _STREAM_END})
                     with _cancelled_lock:
                         _cancelled_ids.discard(req_id)
-                else:
-                    result = await method(*args, **kwargs)
-                    response_queue.put({"id": req_id, "type": "result", "value": result})
-            except Exception as exc:
-                tb = traceback.format_exc()
-                logger.error(f"Error handling request {req_id} (method={method_name}): {exc}\n{tb}")
-                response_queue.put(
-                    {
-                        "id": req_id,
-                        "type": "error",
-                        "error_type": type(exc).__name__,
-                        "message": str(exc),
-                        "status_code": getattr(exc, "status_code", 500),
-                        "detail": getattr(exc, "detail", None),
-                    }
+                except (TimeoutError, asyncio.TimeoutError) as exc:
+                    # Upstream #307: see _dispatch_non_stream_request docstring.
+                    logger.warning(
+                        f"Streaming request {req_id} (method={method_name}) "
+                        f"timed out: {exc}"
+                    )
+                    response_queue.put(
+                        {
+                            "id": req_id,
+                            "type": "error",
+                            "error_type": type(exc).__name__,
+                            "message": str(exc) or "request timeout",
+                            "status_code": 504,
+                            "detail": None,
+                        }
+                    )
+                except Exception as exc:
+                    tb = traceback.format_exc()
+                    logger.error(
+                        f"Error handling streaming request {req_id} "
+                        f"(method={method_name}): {exc}\n{tb}"
+                    )
+                    response_queue.put(
+                        {
+                            "id": req_id,
+                            "type": "error",
+                            "error_type": type(exc).__name__,
+                            "message": str(exc),
+                            "status_code": getattr(exc, "status_code", 500),
+                            "detail": getattr(exc, "detail", None),
+                        }
+                    )
+            else:
+                # Non-streaming dispatch is delegated to a module-level helper
+                # so the (upstream #307) TimeoutError -> 504 mapping is
+                # unit-testable without spawning a subprocess.
+                await _dispatch_non_stream_request(
+                    handler, response_queue, req_id, method_name, args, kwargs
                 )
 
         # ------------------------------------------------------------------

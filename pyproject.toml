@@ -93,6 +93,7 @@ quiet-level = 3
 addopts = "--tb=short"
 markers = [
   "integration: marks tests as integration tests that require external services",
+  "smoke: short integration tests that boot a real server; Apple Silicon only",
 ]
 
 [tool.ruff]

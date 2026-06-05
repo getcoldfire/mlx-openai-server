@@ -12,16 +12,9 @@ want to pay it once per test run, not per test.
 
 from __future__ import annotations
 
-import os
-import signal
-import socket
 import subprocess
-import sys
-import time
 from collections.abc import Iterator
-from pathlib import Path
 
-import httpx
 import pytest
 
 # Re-export from integration conftest so pytest can resolve ``chat_server``

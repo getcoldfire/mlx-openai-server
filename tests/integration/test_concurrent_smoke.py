@@ -5,11 +5,6 @@ to repeat a distinct marker string. Each response MUST contain its own
 marker and NONE of the others — any leakage indicates the BatchScheduler's
 KV cache is bleeding generated tokens between sequences sharing a batch.
 
-Currently xfail (strict=False) for the same MLX stream-affinity bug that
-gates test_chat_smoke.py — see that module's docstring for triage notes.
-Once the chat path works, removing both ``xfail`` markers will validate
-both wire compatibility and continuous-batching isolation.
-
 Markers use a distinctive base32-ish alphabet (no spaces, no model-vocab
 sub-tokens) so substring matching is unambiguous. Budget is generous
 (120s) because 4 concurrent streams on the 1B model on a single GPU
@@ -27,23 +22,20 @@ import pytest
 from tests.integration.conftest import CHAT_MODEL_ID, requires_apple_silicon
 
 
-_KNOWN_STREAM_AFFINITY_BUG = (
-    "Same MLX stream-affinity bug as test_chat_smoke.py — chat completions "
-    "currently 500 with 'There is no Stream(gpu, N) in current thread'."
-)
-
-
 # Use a distinct marker per request. Capital-letter + digit groups avoid
 # accidental in-text collisions and aren't subwords of common English
 # tokens. Each one is unique by construction.
-_MARKERS = ["MARKER42XYZ_ABC123", "TOKEN77ABC_DEF456", "BEACON15LMN_GHI789", "SIGIL33OPQ_JKL012"]
+#
+# Markers intentionally have no underscores or other punctuation Llama tends
+# to elide when reproducing tokens verbatim — the KV-contamination check is
+# what we care about, and a brittle "exact substring" test would noise it.
+_MARKERS = ["MARKER42XYZABC123", "TOKEN77ABCDEF456", "BEACON15LMNGHI789", "SIGIL33OPQJKL012"]
 
 
 @requires_apple_silicon
 @pytest.mark.smoke
 @pytest.mark.integration
 @pytest.mark.asyncio
-@pytest.mark.xfail(reason=_KNOWN_STREAM_AFFINITY_BUG, strict=False)
 async def test_concurrent_no_kv_contamination(chat_server: tuple[str, int]) -> None:
     """4 concurrent chat completions: each response carries only its own marker."""
     base_url, _ = chat_server

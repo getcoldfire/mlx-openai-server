@@ -279,6 +279,26 @@ class BatchScheduler:
                     "mlx_lm.generate.BatchGenerator is not available in the"
                     " installed mlx-lm; upgrade mlx-lm to enable batching."
                 )
+            # Materialize the model's lazy MLX state on the *caller* thread
+            # before spawning the scheduler thread. Without this warm-up, the
+            # first forward pass on the scheduler thread raises
+            # ``RuntimeError: There is no Stream(gpu, N) in current thread.``
+            # because some of the model's deferred allocations (notably
+            # downstream of ``set_wired_limit``) capture a stream reference
+            # from the loading thread that the scheduler thread cannot
+            # resolve. Running a one-token forward + ``mx.eval`` here forces
+            # every lazy allocation to resolve on the loader thread, leaving
+            # only static weights for the scheduler thread to read. This is
+            # an inherited upstream bug — see ``cubist38/mlx-openai-server``
+            # at ``4b7d4b6``. Repro:
+            # ``tests/integration/test_chat_smoke.py::test_non_streaming_completion``
+            # was xfail before this fix.
+            try:
+                self._warm_up_model()
+            except Exception as exc:  # noqa: BLE001 — surface to caller
+                raise RuntimeError(
+                    f"BatchScheduler warm-up forward pass failed: {exc!s}"
+                ) from exc
             self._ready_event.clear()
             self._start_error = None
             self._running = True
@@ -432,6 +452,58 @@ class BatchScheduler:
 
         return _stream()
 
+    def _warm_up_model(self) -> None:
+        """Force a one-token forward pass to materialize lazy MLX state.
+
+        Runs on the caller thread (i.e. the thread that owns ``self._model``'s
+        weights, typically the subprocess main thread). The intent is purely
+        to flush any deferred allocations that would otherwise capture a
+        stream reference from the loader thread on first use — which would
+        then be unresolvable from the scheduler thread.
+
+        The forward pass uses a fresh single-layer prompt cache and a one-
+        token BOS-ish prompt so cost is negligible (~milliseconds on Apple
+        Silicon). We discard the output.
+
+        Skipped silently when ``self._model`` is not a real mlx-lm model
+        (e.g. unit-test mocks that lack ``.layers``); the warm-up is purely
+        an optimization for real MLX models running on Metal.
+        """
+        try:
+            from mlx_lm.models.cache import make_prompt_cache  # noqa: PLC0415
+        except ImportError:  # pragma: no cover — only on broken mlx-lm install
+            logger.warning(
+                "BatchScheduler warm-up skipped: mlx_lm.models.cache unavailable"
+            )
+            return
+
+        # Mock/stub models used by unit tests don't conform to the mlx-lm
+        # nn.Module shape. Skip the warm-up rather than fail.
+        if not hasattr(self._model, "layers"):
+            logger.debug(
+                "BatchScheduler warm-up skipped: model has no .layers attribute"
+                " (likely a test stub)"
+            )
+            return
+
+        # Pick a safe single token. ``bos_token_id`` is the natural choice; if
+        # the tokenizer doesn't expose one, fall back to ``0`` which every
+        # transformer vocab maps to *something* (usually <unk>).
+        bos = getattr(self._tokenizer, "bos_token_id", None)
+        if bos is None:
+            bos = 0
+        try:
+            cache = make_prompt_cache(self._model)
+            tokens = mx.array([[int(bos)]])
+            out = self._model(tokens, cache=cache)
+            # Evaluate both the logits and the cache state so every
+            # downstream allocation is realized here, not lazily on first
+            # scheduler-thread use.
+            mx.eval(out, [c.state for c in cache])
+        except Exception as exc:  # noqa: BLE001 — surface to start()
+            logger.warning(f"BatchScheduler warm-up forward pass failed: {exc!s}")
+            raise
+
     def _run(self) -> None:
         """Main worker loop: construct the generator, admit requests, dispatch.
 
@@ -481,16 +553,30 @@ class BatchScheduler:
                 lock_context = (
                     self._generation_lock if self._generation_lock is not None else nullcontext()
                 )
-                with lock_context:
+                # Pin the entire iteration to ``self._stream``. Every MLX
+                # array created or evaluated inside this block — including
+                # the prompt cache scaffolding allocated by
+                # ``insert_segments`` / ``_make_batch`` / ``_merge_caches``
+                # and the keys/values produced inside ``model(...)`` — is
+                # bound to the scheduler-thread-local stream. Without the
+                # outer wrap, allocations made before ``BatchGenerator.next()``
+                # enters its own ``mx.stream(self._stream)`` context land on
+                # the scheduler thread's default stream (``Stream(gpu, 1)``),
+                # which has no thread-local context registered. The later
+                # ``mx.eval([c.state for c in self.prompt_cache])`` inside
+                # ``BatchGenerator.prompt()`` (mlx_lm/generate.py:1161) then
+                # fails with ``There is no Stream(gpu, 1) in current thread.``
+                # Mirrors the precedent at ``_process_cancellations`` below
+                # where ``remove(...)`` is wrapped for the same reason. This
+                # is an inherited upstream bug — see
+                # ``cubist38/mlx-openai-server@4b7d4b6``.
+                with lock_context, mx.stream(self._stream):
                     self._admit_pending(block_if_empty=len(self._active) == 0)
 
                     while self._running and self._active:
                         try:
                             # ``BatchGenerator.next()`` already wraps itself in its
-                            # own ``mx.stream(...)`` context, so we don't double-wrap
-                            # here. (On mlx-lm ≤ 0.31.3 that stream is the module-
-                            # level ``generation_stream``; after PR #1090 it becomes
-                            # whatever was passed via ``BatchGenerator(stream=...)``.)
+                            # own ``mx.stream(...)`` context; harmless to double-wrap.
                             prompt_responses, gen_responses = self._batch_generator.next()
                         except Exception as exc:  # noqa: BLE001 — propagate per-request
                             logger.exception(f"BatchGenerator.next() raised: {exc!s}")
@@ -615,6 +701,10 @@ class BatchScheduler:
                 cached_prefix_len = len(request.input_ids) - 1
 
             try:
+                # ``insert_segments`` allocates prompt-cache scaffolding that
+                # must be tied to ``self._stream``; the required
+                # ``mx.stream(...)`` context is established by the caller in
+                # ``_run``.
                 uids = self._batch_generator.insert_segments(
                     segments=[segments],
                     max_tokens=[request.max_tokens],

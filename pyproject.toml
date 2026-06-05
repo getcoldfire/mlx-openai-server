@@ -50,9 +50,11 @@ dev = [
   "codespell",
   "mypy",
   "pre-commit",
+  "psutil>=5.9,<8",
   "pytest",
   "pytest-asyncio",
   "ruff",
+  "sentence-transformers>=3.0,<6",
   "types-aiofiles",
   "types-cffi",
   "types-PyMySQL",
@@ -94,6 +96,7 @@ addopts = "--tb=short"
 markers = [
   "integration: marks tests as integration tests that require external services",
   "smoke: short integration tests that boot a real server; Apple Silicon only",
+  "slow: long-running soak tests; pre-release only, never run in CI",
 ]
 
 [tool.ruff]

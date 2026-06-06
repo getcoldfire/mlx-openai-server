@@ -53,6 +53,4 @@ async def register_on_demand_one(
         queue_config=queue_config,
         idle_timeout=idle_timeout,
     )
-    logger.info(
-        f"Model '{model_id}' registered as on-demand (will load when first requested)"
-    )
+    logger.info(f"Model '{model_id}' registered as on-demand (will load when first requested)")

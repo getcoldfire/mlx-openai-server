@@ -19,7 +19,6 @@ event ordering — avoids needing real MLX subprocesses.
 from __future__ import annotations
 
 import asyncio
-from typing import Any
 
 import pytest
 
@@ -84,8 +83,12 @@ async def test_unregister_cancels_idle_task_for_loaded_on_demand_model():
     reg._on_demand_loaded.add("qwen:0.5b")
     reg._handlers["qwen:0.5b"] = _StubHandler()
     from app.schemas.model import ModelMetadata
+
     reg._metadata["qwen:0.5b"] = ModelMetadata(
-        id="qwen:0.5b", type="lm", context_length=None, created_at=0,
+        id="qwen:0.5b",
+        type="lm",
+        context_length=None,
+        created_at=0,
     )
     task = asyncio.create_task(asyncio.sleep(60))
     reg._on_demand_idle_tasks["qwen:0.5b"] = task

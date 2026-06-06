@@ -117,7 +117,7 @@ async def delete_model(model_id: str, request: Request) -> DeleteModelResponse:
         raise HTTPException(
             status_code=HTTPStatus.NOT_FOUND,
             detail=f"Model '{model_id}' is not registered",
-        )
+        ) from None
     except Exception as e:
         logger.exception(f"delete_model failed for '{model_id}'")
         raise HTTPException(

@@ -287,7 +287,7 @@ def models_rm(hf_id: str, force: bool, port: int) -> None:
     """
     path = cache_path_for(hf_id)
     if path is None:
-        click.echo(f"model {hf_id!r} is not in the local cache")
+        click.echo(f"model {hf_id!r} is not in the local cache", err=True)
         raise SystemExit(1)
 
     if not force and is_model_serving(hf_id, port=port):
